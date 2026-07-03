@@ -1,12 +1,12 @@
 // ===== ANIHEIST API — Universal Cloudflare Worker =====
 // Single-file deploy to Cloudflare Workers Dashboard
-// 10 providers with auto-fallback chain
+// 12 providers with auto-fallback chain
 //
 // Endpoints:
 //   /search?q=Death+Note        — Search across providers
 //   /episodes/{anilistId}        — Episode list (Miruro)
 //   /watch/{provider}/{id}/{ep}  — Stream from specific provider
-//   /auto/{id}/{ep}              — Auto-fallback across all providers
+//   /auto/{id}/{ep}              — Auto-fallback across all 12 providers
 //   /health                      — Status
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS", "Content-Type": "application/json" };
@@ -89,66 +89,76 @@ async function providerMiruro(aid, ep) {
   throw new Error("miruro: all failed");
 }
 
-// ===== PROVIDER 2: ANIKOTO (koto) =====
-async function anikotoSearch(q) {
-  const r = await fetch(`https://anikotv.to/ajax/anime/search?keyword=${encodeURIComponent(q)}`, {
-    headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: "https://anikotv.to/" },
-  });
-  if (!r.ok) return [];
-  const d = await r.json();
-  const html = d?.result?.html || "";
-  const results = [];
-  const re = /href="https:\/\/anikotv\.to\/watch\/([^"]+)"[^>]*>\s*([^<]+)/g;
-  let m; while ((m = re.exec(html)) !== null) results.push({ slug: m[1].split("/")[0], title: m[2].trim() });
-  return results;
+// ===== GENERIC ANIKOTO-STYLE PROVIDER (used by anikoto, animesogo, anisuge) =====
+function createAnikotoProvider(name, base) {
+  return async (aid, ep) => {
+    const title = await anilistTitle(aid);
+    if (!title) throw new Error(`${name}: no title`);
+    const sr = await fetch(`${base}/ajax/anime/search?keyword=${encodeURIComponent(title)}`, {
+      headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `${base}/` },
+    });
+    if (!sr.ok) throw new Error(`${name}: search ${sr.status}`);
+    const sd = await sr.json();
+    const sh = sd?.result?.html || "";
+    const pm = sh.match(/href="https?:\/\/[^\/]+\/watch\/([^"]+)"/);
+    if (!pm) throw new Error(`${name}: no results`);
+    const slug = pm[1].split("/")[0];
+    const wr = await fetch(`${base}/watch/${slug}`, { headers: { "User-Agent": UA } });
+    const wh = await wr.text();
+    const idM = wh.match(/data-id=["'](\d+)["']/);
+    if (!idM) throw new Error(`${name}: no ID`);
+    const showId = idM[1];
+    const er = await fetch(`${base}/ajax/episode/list/${showId}`, {
+      headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `${base}/watch/${slug}` },
+    });
+    const ed = await er.json();
+    const eh = ed?.result || "";
+    const nums = [...eh.matchAll(/data-num=["'](\d+)["']/g)];
+    const ids = [...eh.matchAll(/data-ids=["']([^"']+)["']/g)];
+    let tid = "";
+    for (let i = 0; i < nums.length; i++) {
+      if (parseInt(nums[i][1]) === ep) { tid = ids[i][1]; break; }
+    }
+    if (!tid) throw new Error(`${name}: ep ${ep} not found`);
+    const svr = await fetch(`${base}/ajax/server/list?servers=${encodeURIComponent(tid)}`, {
+      headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `${base}/` },
+    });
+    const svd = await svr.json();
+    const svh = svd?.result || "";
+    const secs = svh.split(/<div class="type" data-type="(sub|dub)">/);
+    let lid = "";
+    for (let i = 0; i < secs.length; i++) {
+      if (secs[i] === "sub") { const m = secs[i+1]?.match(/data-link-id="([^"]+)"/); if (m) { lid = m[1]; break; } }
+    }
+    if (!lid) {
+      // Try any server type
+      for (let i = 0; i < secs.length; i++) {
+        if (secs[i] === "sub" || secs[i] === "dub") { const m = secs[i+1]?.match(/data-link-id="([^"]+)"/); if (m) { lid = m[1]; break; } }
+      }
+    }
+    if (!lid) throw new Error(`${name}: no server`);
+    const rr = await fetch(`${base}/ajax/server?get=${encodeURIComponent(lid)}`, {
+      headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `${base}/` },
+    });
+    const rd = await rr.json();
+    const vu = rd?.result?.url?.replace(/\\\//g, "/") || "";
+    if (!vu) throw new Error(`${name}: no URL`);
+    const isEmb = vu.includes("vidtube") || vu.includes("megaplay") || vu.includes("vidwish");
+    return { url: vu, format: isEmb ? "embed" : vu.includes(".m3u8") ? "hls" : "mp4", source: name, headers: { Referer: `${base}/` } };
+  };
 }
 
-async function extractAnikoto(slug, ep) {
-  const wr = await fetch(`https://anikotv.to/watch/${slug}`, { headers: { "User-Agent": UA } });
-  const wh = await wr.text();
-  const idM = wh.match(/data-id=["'](\d+)["']/);
-  if (!idM) throw new Error("koto: no ID");
-  const showId = idM[1];
-  const er = await fetch(`https://anikotv.to/ajax/episode/list/${showId}`, {
-    headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `https://anikotv.to/watch/${slug}` },
-  });
-  const ed = await er.json();
-  const eh = ed?.result || "";
-  const nums = [...eh.matchAll(/data-num=["'](\d+)["']/g)];
-  const ids = [...eh.matchAll(/data-ids=["']([^"']+)["']/g)];
-  let tid = "";
-  for (let i = 0; i < nums.length; i++) {
-    if (parseInt(nums[i][1]) === ep) { tid = ids[i][1]; break; }
-  }
-  if (!tid) throw new Error(`koto: ep ${ep} not found`);
-  const sr = await fetch(`https://anikotv.to/ajax/server/list?servers=${encodeURIComponent(tid)}`, {
-    headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: "https://anikotv.to/" },
-  });
-  const sd = await sr.json();
-  const sh = sd?.result || "";
-  const secs = sh.split(/<div class="type" data-type="(sub|dub)">/);
-  let lid = "";
-  for (let i = 0; i < secs.length; i++) {
-    if (secs[i] === "sub") { const m = secs[i+1]?.match(/data-link-id="([^"]+)"/); if (m) { lid = m[1]; break; } }
-  }
-  if (!lid) throw new Error("koto: no server");
-  const rr = await fetch(`https://anikotv.to/ajax/server?get=${encodeURIComponent(lid)}`, {
-    headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: "https://anikotv.to/" },
-  });
-  const rd = await rr.json();
-  const vu = rd?.result?.url?.replace(/\\\//g, "/") || "";
-  if (!vu) throw new Error("koto: no URL");
-  const isEmb = vu.includes("vidtube") || vu.includes("megaplay") || vu.includes("vidwish");
-  return { url: vu, format: isEmb ? "embed" : vu.includes(".m3u8") ? "hls" : "mp4", source: "anikoto", headers: { Referer: "https://anikotv.to/" } };
-}
+// ===== PROVIDER 2: ANIKOTO (koto) via generic factory =====
+const providerKoto = createAnikotoProvider("anikoto", "https://anikotv.to");
 
-async function providerKoto(aid, ep) {
-  const title = await anilistTitle(aid);
-  if (!title) throw new Error("koto: no title");
-  const results = await anikotoSearch(title);
-  if (!results.length) throw new Error("koto: no results");
-  return extractAnikoto(results[0].slug, ep);
-}
+// ===== PROVIDER 3: ANIMESOGO =====
+const providerAnimeSogo = createAnikotoProvider("animesogo", "https://animesogo.to");
+
+// ===== PROVIDER 4: ANISUGE =====
+const providerAniSuge = createAnikotoProvider("anisuge", "https://anisuge.tv");
+
+// ===== PROVIDER 5: ANIWAVES =====
+async function providerAniwaves(aid, ep) {
 
 // ===== PROVIDER 3: ANIWAVES =====
 async function providerAniwaves(aid, ep) {
@@ -340,6 +350,8 @@ async function providerKissanime(aid, ep) {
 const PROVIDERS = [
   { name: "miruro", fn: providerMiruro },
   { name: "anikoto", fn: providerKoto },
+  { name: "animesogo", fn: providerAnimeSogo },
+  { name: "anisuge", fn: providerAniSuge },
   { name: "aniwaves", fn: providerAniwaves },
   { name: "animepahe", fn: providerPahe },
   { name: "reanime", fn: providerReanime },
@@ -364,13 +376,25 @@ async function handleRequest(request) {
       ]});
     }
 
-    // Search
+    // Search across anikoto-style sites
     if (path === "/search") {
       const q = url.searchParams.get("q") || url.searchParams.get("query");
       if (!q) return json({ error: "Missing ?q=" }, 400);
       let results = [];
-      try { results = await anikotoSearch(q); } catch {}
-      return json({ success: true, results, count: results.length, source: "anikoto" });
+      for (const base of ["https://anikotv.to", "https://animesogo.to", "https://anisuge.tv"]) {
+        try {
+          const r = await fetch(`${base}/ajax/anime/search?keyword=${encodeURIComponent(q)}`, {
+            headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest", Referer: `${base}/` },
+          });
+          if (!r.ok) continue;
+          const d = await r.json();
+          const html = d?.result?.html || "";
+          const re = /href="https?:\/\/[^\/]+\/watch\/([^"]+)"[^>]*>\s*([^<]+)/g;
+          let m; while ((m = re.exec(html)) !== null) results.push({ slug: m[1].split("/")[0], title: m[2].trim(), source: base });
+          if (results.length) break;
+        } catch {}
+      }
+      return json({ success: true, results, count: results.length });
     }
 
     // Episodes via Miruro pipe
