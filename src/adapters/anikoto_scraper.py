@@ -6,7 +6,10 @@ from src.models.stream import StreamResult, ParserError
 
 log = get_logger(__name__)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 SITES = {
     "anikoto": {"base": "https://anikototv.to", "name": "Anikoto"},
@@ -23,9 +26,11 @@ async def _get_anilist_title(anilist_id: int) -> str:
             }
         }
         """
-        r = await c.post("https://graphql.anilist.co",
+        r = await c.post(
+            "https://graphql.anilist.co",
             json={"query": q, "variables": {"id": anilist_id}},
-            headers={"Accept": "application/json", "Content-Type": "application/json"})
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
         if r.status_code == 200:
             m = r.json().get("data", {}).get("Media", {})
             t = m.get("title", {})
@@ -33,21 +38,47 @@ async def _get_anilist_title(anilist_id: int) -> str:
     return ""
 
 
-async def _search_site(base: str, keyword: str) -> list[dict]:
-    ajax_headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest", "Referer": f"{base}/"}
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        r = await c.get(f"{base}/ajax/anime/search?keyword={keyword}", headers=ajax_headers)
-        if r.status_code != 200:
-            return []
+def _ajax_headers(base: str, referer: Optional[str] = None) -> dict[str, str]:
+    return {
+        **HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": referer or f"{base}/",
+    }
+
+
+async def _json_response(client: httpx.AsyncClient, url: str, *, params=None, headers=None) -> dict:
+    r = await client.get(url, params=params, headers=headers)
+    if r.status_code != 200:
+        raise ParserError(f"HTTP {r.status_code} from {r.url}")
+    try:
         data = r.json()
-        html = data.get("result", {}).get("html", "")
+    except ValueError as exc:
+        content_type = r.headers.get("content-type", "unknown")
+        preview = " ".join(r.text[:160].split())
+        raise ParserError(
+            f"Expected JSON from {r.url}; got {content_type}: {preview}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ParserError(f"Unexpected response shape from {r.url}")
+    return data
+
+
+async def _search_site(base: str, keyword: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        data = await _json_response(
+            c,
+            f"{base}/ajax/anime/search",
+            params={"keyword": keyword},
+            headers=_ajax_headers(base),
+        )
+        result = data.get("result") or {}
+        html = result.get("html", "") if isinstance(result, dict) else ""
         results = []
         for m in re.finditer(r'href="[^"]*/watch/([^"]+)"', html):
             path = m.group(1).split("/")[0]
-            # aniwaves format: slug-id (death-note-79992)
-            # anikoto format: slug only (death-note-fc8mq)
             parts = path.rsplit("-", 1)
-            if parts[1].isdigit():
+            if len(parts) == 2 and parts[1].isdigit():
                 slug = parts[0]
                 show_id = parts[1]
             else:
@@ -67,38 +98,41 @@ async def _get_show_id(base: str, slug: str) -> Optional[str]:
 
 
 async def _get_episode_list(base: str, show_id: str) -> list[dict]:
-    ajax_headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest", "Referer": f"{base}/"}
+    """Legacy Anikoto episode-list parser."""
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        r = await c.get(f"{base}/ajax/episode/list/{show_id}", headers=ajax_headers)
-        if r.status_code != 200:
-            return []
-        data = r.json()
+        data = await _json_response(
+            c,
+            f"{base}/ajax/episode/list/{show_id}",
+            headers=_ajax_headers(base),
+        )
         html = data.get("result", "")
         eps = []
         nums = re.findall(r'data-num=["\'](\d+)', html)
         ids = re.findall(r'data-ids=["\']([^"\']+)', html)
-        for i in range(len(nums)):
+        for i, value in enumerate(nums):
             eps.append({
-                "num": int(nums[i]),
+                "num": int(value),
                 "ids": ids[i] if i < len(ids) else "",
             })
         return eps
 
 
 async def _get_servers(base: str, server_ids: str, audio: str = "sub") -> list[dict]:
-    ajax_headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest", "Referer": f"{base}/"}
+    """Legacy Anikoto server-list parser."""
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        r = await c.get(f"{base}/ajax/server/list?servers={server_ids}", headers=ajax_headers)
-        if r.status_code != 200:
-            return []
-        data = r.json()
+        data = await _json_response(
+            c,
+            f"{base}/ajax/server/list",
+            params={"servers": server_ids},
+            headers=_ajax_headers(base),
+        )
         html = data.get("result", "")
         servers = []
         sections = re.split(r'<div class="type" data-type="(sub|dub)">', html)
         in_target = False
         for piece in sections:
             if piece in ("sub", "dub"):
-                in_target = (piece == audio)
+                in_target = piece == audio
             elif in_target:
                 for m in re.finditer(r'data-link-id="([^"]+)"', piece):
                     servers.append({"link_id": m.group(1)})
@@ -107,16 +141,20 @@ async def _get_servers(base: str, server_ids: str, audio: str = "sub") -> list[d
 
 
 async def _resolve_server(base: str, link_id: str) -> Optional[str]:
-    ajax_headers = {**HEADERS, "X-Requested-With": "XMLHttpRequest", "Referer": f"{base}/"}
+    """Legacy Anikoto source resolver."""
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        r = await c.get(f"{base}/ajax/server?get={link_id}", headers=ajax_headers)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        return data.get("result", {}).get("url", "")
+        data = await _json_response(
+            c,
+            f"{base}/ajax/server",
+            params={"get": link_id},
+            headers=_ajax_headers(base),
+        )
+        result = data.get("result") or {}
+        return result.get("url", "") if isinstance(result, dict) else ""
 
 
 async def _scrape_site(base: str, site_name: str, anilist_id: int, episode: int, dub: bool = False) -> StreamResult:
+    """Legacy flow retained for Anikoto."""
     title = await _get_anilist_title(anilist_id)
     if not title:
         raise ParserError(f"{site_name}: Could not resolve AniList title")
@@ -156,8 +194,129 @@ async def _scrape_site(base: str, site_name: str, anilist_id: int, episode: int,
         url=video_url.replace("\\/", "/"),
         source=site_name,
         format=fmt,
-        headers={"Referer": f"{base}/", "Origin": f"{base}"},
+        headers={"Referer": f"{base}/", "Origin": base},
     )
+
+
+async def _aniwaves_episode_numbers(base: str, series_id: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        data = await _json_response(
+            c,
+            f"{base}/ajax/episode/list/{series_id}",
+            headers=_ajax_headers(base),
+        )
+    html = data.get("result", "")
+    rows = []
+    pattern = re.compile(
+        r'<a[^>]*data-num=["\'](\d+)["\'][^>]*data-sub=["\'](\d*)["\'][^>]*data-dub=["\'](\d*)["\'][^>]*>',
+        re.S,
+    )
+    for number, has_sub, has_dub in pattern.findall(html):
+        rows.append({
+            "num": int(number),
+            "has_sub": has_sub == "1",
+            "has_dub": has_dub == "1",
+        })
+    return rows
+
+
+async def _aniwaves_servers(
+    base: str,
+    series_id: str,
+    episode: int,
+    audio: str,
+    referer: str,
+) -> list[dict]:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        data = await _json_response(
+            c,
+            f"{base}/ajax/server/list",
+            params={"servers": series_id, "eps": episode},
+            headers=_ajax_headers(base, referer),
+        )
+    if data.get("status") != 200:
+        return []
+    html = data.get("result", "")
+    blocks = re.findall(
+        r'<div class="type" data-type="([a-z]+)">.*?<ul>(.*?)</ul>',
+        html,
+        re.S,
+    )
+    for kind, block in blocks:
+        if kind != audio:
+            continue
+        return [
+            {"server_id": server_id, "link_id": link_id, "name": name.strip() or "Server"}
+            for server_id, link_id, name in re.findall(
+                r'<li[^>]*data-sv-id="(\d+)"[^>]*data-link-id="([^"]+)"[^>]*>([^<]*)</li>',
+                block,
+            )
+        ]
+    return []
+
+
+async def _aniwaves_resolve(base: str, link_id: str, referer: str) -> Optional[str]:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        data = await _json_response(
+            c,
+            f"{base}/ajax/sources",
+            params={"id": link_id, "asi": 0, "autoPlay": 1},
+            headers=_ajax_headers(base, referer),
+        )
+    if data.get("status") != 200:
+        return None
+    result = data.get("result") or {}
+    return result.get("url", "") if isinstance(result, dict) else ""
+
+
+async def _scrape_aniwaves(anilist_id: int, episode: int, dub: bool = False) -> StreamResult:
+    base = SITES["aniwaves"]["base"]
+    title = await _get_anilist_title(anilist_id)
+    if not title:
+        raise ParserError("aniwaves: Could not resolve AniList title")
+
+    results = await _search_site(base, title)
+    if not results:
+        raise ParserError(f"aniwaves: No results for '{title}'")
+
+    match = next((item for item in results if item.get("show_id")), None)
+    if not match:
+        raise ParserError("aniwaves: Search result did not contain a numeric series ID")
+
+    series_id = match["show_id"]
+    watch_path = match["path"]
+    referer = f"{base}/watch/{watch_path}/ep-{episode}"
+
+    episode_rows = await _aniwaves_episode_numbers(base, series_id)
+    target = next((item for item in episode_rows if item["num"] == episode), None)
+    if not target:
+        raise ParserError(f"aniwaves: Episode {episode} not found")
+
+    audio = "dub" if dub else "sub"
+    if audio == "dub" and not target["has_dub"]:
+        raise ParserError(f"aniwaves: Episode {episode} has no dub")
+    if audio == "sub" and not target["has_sub"]:
+        raise ParserError(f"aniwaves: Episode {episode} has no sub")
+
+    servers = await _aniwaves_servers(base, series_id, episode, audio, referer)
+    if not servers:
+        raise ParserError(f"aniwaves: No {audio} servers available for episode {episode}")
+
+    for server in servers:
+        video_url = await _aniwaves_resolve(base, server["link_id"], referer)
+        if not video_url:
+            continue
+        video_url = video_url.replace("\\/", "/")
+        lower = video_url.lower()
+        fmt = "hls" if ".m3u8" in lower else "mp4" if ".mp4" in lower else "embed"
+        return StreamResult(
+            url=video_url,
+            source=f"aniwaves/{server['name']}",
+            format=fmt,
+            headers={"Referer": f"{base}/", "Origin": base},
+        )
+
+    raise ParserError("aniwaves: Could not resolve any server")
 
 
 async def get_anikoto_stream(anilist_id: int, episode: int, dub: bool = False) -> StreamResult:
@@ -165,4 +324,4 @@ async def get_anikoto_stream(anilist_id: int, episode: int, dub: bool = False) -
 
 
 async def get_aniwaves_stream(anilist_id: int, episode: int, dub: bool = False) -> StreamResult:
-    return await _scrape_site(SITES["aniwaves"]["base"], "aniwaves", anilist_id, episode, dub)
+    return await _scrape_aniwaves(anilist_id, episode, dub)
