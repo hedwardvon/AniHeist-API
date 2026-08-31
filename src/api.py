@@ -498,3 +498,8 @@ async def reset_fallback_state(source: Optional[str] = Query(None, description="
         "status": "success",
         "message": f"Fallback state reset for {'all sources' if not source else source}",
     }
+
+# KitsuneArc MAL-native compatibility routes
+from src.kitsunearc_api import router as kitsunearc_router, bind_orchestrator as bind_kitsunearc_orchestrator
+bind_kitsunearc_orchestrator(orchestrator)
+app.include_router(kitsunearc_router)

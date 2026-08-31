@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright Chromium browser (needed for Miruro Playwright fallback)
-RUN python3 -m playwright install chromium --with-deps \
+RUN python3 -m playwright install chromium \
     && rm -rf /root/.cache/ms-playwright/chromium-*/chrome-linux64/locales \
     && rm -rf /var/lib/apt/lists/*
 
@@ -22,6 +22,7 @@ COPY src/ ./src/
 COPY consumet_api/ ./consumet_api/
 COPY tests/ ./tests/
 COPY start.sh .
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
@@ -29,3 +30,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000 4000
 
 CMD ./start.sh
+

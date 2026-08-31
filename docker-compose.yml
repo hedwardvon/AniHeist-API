@@ -9,7 +9,7 @@ services:
     image: anime-scraper-api:latest
     container_name: anime-scraper-api
     ports:
-      - "8000:8000"
+      - "8102:8000"
     env_file: .env
     environment:
       - REDIS_URL=redis://redis:6379/0
